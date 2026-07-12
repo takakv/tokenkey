@@ -137,7 +137,7 @@ impl TokenKey {
         let der = self.cert_der.as_deref().ok_or_else(|| {
             TokenkeyError::NotFound("no certificate is associated with this key".into())
         })?;
-        crate::algo::algorithm_from_cert_der(der)
+        KeyAlgorithm::from_certificate_der(der)
     }
 
     /// The DER of the key's certificate, or `None` for an HSM key with no

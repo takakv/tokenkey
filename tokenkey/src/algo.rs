@@ -34,36 +34,39 @@ pub enum SignScheme {
     Ecdsa(Hash),
 }
 
-pub(crate) fn algorithm_from_cert_der(cert_der: &[u8]) -> Result<KeyAlgorithm> {
-    let cert = x509_cert::Certificate::from_der(cert_der)
-        .map_err(|e| TokenkeyError::Certificate(format!("certificate is not valid DER: {e}")))?;
-    let spki = &cert.tbs_certificate.subject_public_key_info;
-    let alg_oid = spki.algorithm.oid;
+impl KeyAlgorithm {
+    pub fn from_certificate_der(cert_der: &[u8]) -> Result<KeyAlgorithm> {
+        let cert = x509_cert::Certificate::from_der(cert_der).map_err(|e| {
+            TokenkeyError::Certificate(format!("certificate is not valid DER: {e}"))
+        })?;
+        let spki = &cert.tbs_certificate.subject_public_key_info;
+        let alg_oid = spki.algorithm.oid;
 
-    if alg_oid == OID_EC_PUBLIC_KEY {
-        let params = spki.algorithm.parameters.as_ref().ok_or_else(|| {
-            TokenkeyError::Unsupported("explicit EC parameters are not supported".into())
-        })?;
-        let curve: ObjectIdentifier = params.decode_as().map_err(|e| {
-            TokenkeyError::Certificate(format!("named curve parameter is not an OID: {e}"))
-        })?;
-        if curve == OID_P256 {
-            return Ok(KeyAlgorithm::Ec(EcCurve::P256));
+        if alg_oid == OID_EC_PUBLIC_KEY {
+            let params = spki.algorithm.parameters.as_ref().ok_or_else(|| {
+                TokenkeyError::Unsupported("explicit EC parameters are not supported".into())
+            })?;
+            let curve: ObjectIdentifier = params.decode_as().map_err(|e| {
+                TokenkeyError::Certificate(format!("named curve parameter is not an OID: {e}"))
+            })?;
+            if curve == OID_P256 {
+                return Ok(KeyAlgorithm::Ec(EcCurve::P256));
+            }
+            if curve == OID_P384 {
+                return Ok(KeyAlgorithm::Ec(EcCurve::P384));
+            }
+            if curve == OID_P521 {
+                return Ok(KeyAlgorithm::Ec(EcCurve::P521));
+            }
+            return Err(TokenkeyError::Unsupported(format!(
+                "unsupported EC curve {curve} (only P-256/P-384/P-521)"
+            )));
         }
-        if curve == OID_P384 {
-            return Ok(KeyAlgorithm::Ec(EcCurve::P384));
-        }
-        if curve == OID_P521 {
-            return Ok(KeyAlgorithm::Ec(EcCurve::P521));
-        }
-        return Err(TokenkeyError::Unsupported(format!(
-            "unsupported EC curve {curve} (only P-256/P-384/P-521)"
-        )));
+
+        Err(TokenkeyError::Unsupported(format!(
+            "unsupported key algorithm {alg_oid} (only EC P-256/P-384/P-521)"
+        )))
     }
-
-    Err(TokenkeyError::Unsupported(format!(
-        "unsupported key algorithm {alg_oid} (only EC P-256/P-384/P-521)"
-    )))
 }
 
 pub(crate) fn mechanism_and_input(

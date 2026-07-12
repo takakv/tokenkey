@@ -40,7 +40,7 @@ pub struct DiscoveredKey {
 
 impl DiscoveredKey {
     pub fn algorithm(&self) -> Result<KeyAlgorithm> {
-        crate::algo::algorithm_from_cert_der(&self.cert_der)
+        KeyAlgorithm::from_certificate_der(&self.cert_der)
     }
 }
 
