@@ -6,6 +6,6 @@ license.workspace = true
 description = "Estonian ID card convenience layer over tokenkey"
 
 [dependencies]
-tokenkey = { path = "../tokenkey" }
+tokenkey = { version = "0.1.0", path = "../tokenkey" }
 x509-cert.workspace = true
 thiserror.workspace = true
