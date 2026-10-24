@@ -41,7 +41,7 @@ impl IdCard {
         &self.sign.cert_der
     }
 
-    /// Open the Authentication key. Requires PIN1.
+    /// Open the Authentication key, for authentication and decryption. Requires PIN1.
     pub fn open_auth(&self, pin1: &str) -> Result<TokenKey> {
         Ok(TokenKey::open_discovered(&self.auth, pin1)?)
     }
