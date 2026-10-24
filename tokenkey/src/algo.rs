@@ -34,6 +34,27 @@ pub enum SignScheme {
     Ecdsa(Hash),
 }
 
+impl EcCurve {
+    /// Length of the curve's field elements in bytes.
+    pub(crate) fn field_len(self) -> usize {
+        match self {
+            EcCurve::P256 => 32,
+            EcCurve::P384 => 48,
+            EcCurve::P521 => 66,
+        }
+    }
+
+    /// The curve of an uncompressed SEC1 point, `0x04 || X || Y`, by its length.
+    pub(crate) fn from_uncompressed_point(point: &[u8]) -> Option<EcCurve> {
+        if point.first() != Some(&0x04) {
+            return None;
+        }
+        [EcCurve::P256, EcCurve::P384, EcCurve::P521]
+            .into_iter()
+            .find(|curve| point.len() == 2 * curve.field_len() + 1)
+    }
+}
+
 impl KeyAlgorithm {
     pub fn from_certificate_der(cert_der: &[u8]) -> Result<KeyAlgorithm> {
         let cert = x509_cert::Certificate::from_der(cert_der).map_err(|e| {

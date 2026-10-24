@@ -2,12 +2,15 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
 use cryptoki::context::Pkcs11;
-use cryptoki::object::{Attribute, AttributeType, ObjectClass, ObjectHandle};
+use cryptoki::error::{Error as CkError, RvError};
+use cryptoki::mechanism::Mechanism;
+use cryptoki::mechanism::elliptic_curve::{EcKdf, Ecdh1DeriveParams};
+use cryptoki::object::{Attribute, AttributeType, KeyType, ObjectClass, ObjectHandle};
 use cryptoki::session::{Session, UserType};
 use cryptoki::slot::Slot;
-use cryptoki::types::AuthPin;
+use cryptoki::types::{AuthPin, Ulong};
 
-use crate::algo::{KeyAlgorithm, SignScheme, mechanism_and_input};
+use crate::algo::{EcCurve, KeyAlgorithm, SignScheme, mechanism_and_input};
 use crate::discover::DiscoveredKey;
 use crate::error::{Result, TokenkeyError};
 use crate::pkcs11::{CkResultExt, exactly_one, find_unique, initialize, initialized_slots, login};
@@ -144,6 +147,64 @@ impl TokenKey {
         self.context_login(&session)?;
         session.sign_update(&input).ck("C_SignUpdate")?;
         session.sign_final().ck("C_SignFinal")
+    }
+
+    /// ECDH with this key and `peer_public_key`. Returns the x-coordinate as the shared secret.
+    /// `peer_public_key` must be an uncompressed point, `0x04 || X || Y`, on P-256, P-384 or P-521.
+    pub fn derive_ecdh(&self, peer_public_key: &[u8]) -> Result<Vec<u8>> {
+        let curve = EcCurve::from_uncompressed_point(peer_public_key).ok_or_else(|| {
+            TokenkeyError::InvalidPeerKey(
+                "expected an uncompressed P-256, P-384 or P-521 point".into(),
+            )
+        })?;
+        if let Ok(KeyAlgorithm::Ec(key_curve)) = self.algorithm()
+            && key_curve != curve
+        {
+            return Err(TokenkeyError::InvalidPeerKey(format!(
+                "peer key is {curve:?}, but this key is {key_curve:?}"
+            )));
+        }
+
+        let field_len = curve.field_len();
+        let mechanism =
+            Mechanism::Ecdh1Derive(Ecdh1DeriveParams::new(EcKdf::null(), peer_public_key));
+        let template = [
+            Attribute::Class(ObjectClass::SECRET_KEY),
+            Attribute::KeyType(KeyType::GENERIC_SECRET),
+            Attribute::Token(false),
+            Attribute::Sensitive(false),
+            Attribute::Extractable(true),
+            Attribute::ValueLen(Ulong::new(field_len as _)),
+        ];
+
+        let session = self.lock()?;
+        // C_DeriveKey has no init step for the PIN.
+        match self.context_login(&session) {
+            Ok(())
+            | Err(TokenkeyError::Pkcs11 {
+                source: CkError::Pkcs11(RvError::OperationNotInitialized, _),
+                ..
+            }) => {}
+            Err(e) => return Err(e),
+        }
+        let secret_key = session
+            .derive_key(&mechanism, self.key_handle, &template)
+            .ck("C_DeriveKey")?;
+        let attrs = session.get_attributes(secret_key, &[AttributeType::Value]);
+        session.destroy_object(secret_key).ck("C_DestroyObject")?;
+        let value = attrs
+            .ck("C_GetAttributeValue")?
+            .into_iter()
+            .find_map(|a| match a {
+                Attribute::Value(v) => Some(v),
+                _ => None,
+            });
+        match value {
+            Some(secret) if secret.len() == field_len => Ok(secret),
+            _ => Err(TokenkeyError::Unsupported(format!(
+                "token did not return a {field_len}-byte secret"
+            ))),
+        }
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Session>> {

@@ -42,6 +42,10 @@ pub enum TokenkeyError {
     #[error("{0}")]
     Unsupported(String),
 
+    /// A peer public key is malformed or does not match this key's curve.
+    #[error("invalid peer public key: {0}")]
+    InvalidPeerKey(String),
+
     /// A certificate could not be parsed.
     #[error("certificate parsing failed: {0}")]
     Certificate(String),
