@@ -4,7 +4,7 @@
 //! Run with:
 //!   cargo run -p esteid-cryptoki --example detect_card
 
-use esteid_cryptoki::{modules, EstEidError, IdCard};
+use esteid_cryptoki::{EstEidError, IdCard, modules};
 
 fn main() {
     println!("Scanning for connected Estonian ID cards...\n");

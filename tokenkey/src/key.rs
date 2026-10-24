@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Mutex, MutexGuard};
 
 use cryptoki::context::Pkcs11;
 use cryptoki::object::{Attribute, AttributeType, ObjectClass, ObjectHandle};
@@ -7,15 +7,13 @@ use cryptoki::session::{Session, UserType};
 use cryptoki::slot::Slot;
 use cryptoki::types::AuthPin;
 
-use crate::algo::{mechanism_and_input, KeyAlgorithm, SignScheme};
+use crate::algo::{KeyAlgorithm, SignScheme, mechanism_and_input};
 use crate::discover::DiscoveredKey;
 use crate::error::{Result, TokenkeyError};
-use crate::pkcs11::{
-    find_unique, initialize, map_login_result, select_single_initialized_slot, select_unique_slot,
-};
+use crate::pkcs11::{CkResultExt, exactly_one, find_unique, initialize, initialized_slots, login};
 
 pub enum SlotSelect {
-    /// The sole slot with an initialized token; errors if several are present.
+    /// The unique slot with an initialized token.
     SoleToken,
     /// A specific slot id (`CK_SLOT_ID`).
     Id(u64),
@@ -43,13 +41,11 @@ pub struct KeyLocator {
 
 /// A private key opened on a PKCS#11 token.
 pub struct TokenKey {
-    session: Arc<Mutex<Session>>,
+    session: Mutex<Session>,
     key_handle: ObjectHandle,
     cert_der: Option<Vec<u8>>,
-    always_authenticate: bool,
-    pin: Option<AuthPin>,
-    #[allow(dead_code)]
-    provider: Pkcs11,
+    /// The PIN, kept only for `CKA_ALWAYS_AUTHENTICATE` keys.
+    context_pin: Option<AuthPin>,
 }
 
 impl TokenKey {
@@ -81,53 +77,30 @@ impl TokenKey {
         pin: &str,
         cert_override: Option<Vec<u8>>,
     ) -> Result<TokenKey> {
-        let provider = initialize(&locator.module)?;
-        let slot = select_slot(&provider, &locator.slot)?;
+        let pkcs11 = initialize(&locator.module)?;
+        let slot = select_slot(&pkcs11, &locator.slot)?;
 
-        let token_info = provider
-            .get_token_info(slot)
-            .map_err(|source| TokenkeyError::Pkcs11 {
-                call: "C_GetTokenInfo",
-                source,
-            })?;
+        let token_info = pkcs11.get_token_info(slot).ck("C_GetTokenInfo")?;
         if token_info.protected_authentication_path() {
             return Err(TokenkeyError::Unsupported("PIN pads not supported".into()));
         }
 
-        let session = provider
-            .open_rw_session(slot)
-            .map_err(|source| TokenkeyError::Pkcs11 {
-                call: "C_OpenSession",
-                source,
-            })?;
-
-        let auth_pin = AuthPin::new(pin.to_owned().into());
-        map_login_result(session.login(UserType::User, Some(&auth_pin)))?;
+        let session = pkcs11.open_rw_session(slot).ck("C_OpenSession")?;
+        let pin = AuthPin::new(pin.into());
+        login(&session, UserType::User, &pin)?;
 
         let key_handle = resolve_private_key(&session, &locator.key)?;
-
-        let always_authenticate = read_always_authenticate(&session, key_handle)?;
-
         let cert_der = match cert_override {
             Some(der) => Some(der),
             None => resolve_certificate(&session, key_handle)?,
         };
-
-        let pin = if always_authenticate {
-            Some(auth_pin)
-        } else {
-            None
-        };
-
-        let session = Arc::new(Mutex::new(session));
+        let context_pin = read_always_authenticate(&session, key_handle)?.then_some(pin);
 
         Ok(TokenKey {
-            session,
+            session: Mutex::new(session),
             key_handle,
             cert_der,
-            always_authenticate,
-            pin,
-            provider,
+            context_pin,
         })
     }
 
@@ -148,86 +121,62 @@ impl TokenKey {
 
     /// Whether this key has `CKA_ALWAYS_AUTHENTICATE` set.
     pub fn always_authenticate(&self) -> bool {
-        self.always_authenticate
+        self.context_pin.is_some()
     }
 
-    /// Sign data.
+    /// Hash `data` and sign it. ECDSA signatures are raw `r || s`.
     pub fn sign(&self, scheme: SignScheme, data: &[u8]) -> Result<Vec<u8>> {
         let (mechanism, input) = mechanism_and_input(scheme, data)?;
+        let session = self.lock()?;
 
-        if self.always_authenticate {
-            return self.sign_context_specific(mechanism, &input);
+        if self.context_pin.is_none() {
+            return session
+                .sign(&mechanism, self.key_handle, &input)
+                .ck("C_Sign");
         }
 
-        let session = self.session.lock().map_err(|_| TokenkeyError::Poisoned)?;
-        session
-            .sign(&mechanism, self.key_handle, &input)
-            .map_err(|source| TokenkeyError::Pkcs11 {
-                call: "C_Sign",
-                source,
-            })
-    }
-
-    /// Sign with a `CKA_ALWAYS_AUTHENTICATE` key.
-    fn sign_context_specific(
-        &self,
-        mechanism: cryptoki::mechanism::Mechanism<'_>,
-        input: &[u8],
-    ) -> Result<Vec<u8>> {
-        let pin = self.pin.as_ref().ok_or_else(|| {
-            TokenkeyError::Unsupported("missing PIN for always authenticated key".into())
-        })?;
-
-        let session = self.session.lock().map_err(|_| TokenkeyError::Poisoned)?;
-
+        // The PIN must be entered between C_SignInit and C_Sign, but cryptoki's
+        // `sign` does both in one call. Work around this by finishing with C_SignUpdate
+        // and C_SignFinal instead. While not spec-compliant, it works with OpenSC.
         session
             .sign_init(&mechanism, self.key_handle)
-            .map_err(|source| TokenkeyError::Pkcs11 {
-                call: "C_SignInit",
-                source,
-            })?;
+            .ck("C_SignInit")?;
+        self.context_login(&session)?;
+        session.sign_update(&input).ck("C_SignUpdate")?;
+        session.sign_final().ck("C_SignFinal")
+    }
 
-        map_login_result(session.login(UserType::ContextSpecific, Some(pin)))?;
+    fn lock(&self) -> Result<MutexGuard<'_, Session>> {
+        self.session.lock().map_err(|_| TokenkeyError::Poisoned)
+    }
 
-        // CKM_ECDSA is formally one-shot, but OpenSC accepts passes by buffering.
-        session
-            .sign_update(input)
-            .map_err(|source| TokenkeyError::Pkcs11 {
-                call: "C_SignUpdate",
-                source,
-            })?;
-        session
-            .sign_final()
-            .map_err(|source| TokenkeyError::Pkcs11 {
-                call: "C_SignFinal",
-                source,
-            })
+    /// Re-enter the PIN for the operation just started, if the key requires it.
+    fn context_login(&self, session: &Session) -> Result<()> {
+        match &self.context_pin {
+            Some(pin) => login(session, UserType::ContextSpecific, pin),
+            None => Ok(()),
+        }
     }
 }
 
-/// Select the slot per `select`.
-fn select_slot(provider: &Pkcs11, select: &SlotSelect) -> Result<Slot> {
+fn select_slot(pkcs11: &Pkcs11, select: &SlotSelect) -> Result<Slot> {
     match select {
-        SlotSelect::SoleToken => {
-            let slots = provider
-                .get_slots_with_initialized_token()
-                .map_err(|source| TokenkeyError::Pkcs11 {
-                    call: "C_GetSlotList",
-                    source,
-                })?;
-            select_single_initialized_slot(&slots)
-        }
+        SlotSelect::SoleToken => exactly_one(
+            &initialized_slots(pkcs11)?,
+            || "no slots with an initialized token found".into(),
+            |many| {
+                let ids: Vec<String> = many.iter().map(|slot| slot.id().to_string()).collect();
+                format!(
+                    "multiple initialized token slots found ({}); select the token by slot id or label",
+                    ids.join(", ")
+                )
+            },
+        ),
         SlotSelect::Id(id) => {
             let slot = Slot::try_from(*id).map_err(|e| {
                 TokenkeyError::NotFound(format!("invalid PKCS#11 slot id {id}: {e}"))
             })?;
-            let token_info =
-                provider
-                    .get_token_info(slot)
-                    .map_err(|source| TokenkeyError::Pkcs11 {
-                        call: "C_GetTokenInfo",
-                        source,
-                    })?;
+            let token_info = pkcs11.get_token_info(slot).ck("C_GetTokenInfo")?;
             if !token_info.token_initialized() {
                 return Err(TokenkeyError::NotFound(format!(
                     "slot {id} does not contain an initialized token"
@@ -236,35 +185,21 @@ fn select_slot(provider: &Pkcs11, select: &SlotSelect) -> Result<Slot> {
             Ok(slot)
         }
         SlotSelect::TokenLabel(label) => {
-            let slots = provider
-                .get_slots_with_initialized_token()
-                .map_err(|source| TokenkeyError::Pkcs11 {
-                    call: "C_GetSlotList",
-                    source,
-                })?;
             let mut matches = Vec::new();
-            for slot in slots {
-                let token_info =
-                    provider
-                        .get_token_info(slot)
-                        .map_err(|source| TokenkeyError::Pkcs11 {
-                            call: "C_GetTokenInfo",
-                            source,
-                        })?;
-                if token_info.label() == label {
+            for slot in initialized_slots(pkcs11)? {
+                if pkcs11.get_token_info(slot).ck("C_GetTokenInfo")?.label() == label {
                     matches.push(slot);
                 }
             }
-            select_unique_slot(
+            exactly_one(
                 &matches,
                 || format!("no initialized token matches label {label:?}"),
-                || format!("multiple initialized tokens match label {label:?}; select by slot id"),
+                |_| format!("multiple initialized tokens match label {label:?}; select by slot id"),
             )
         }
     }
 }
 
-/// Resolve the private key handle per `select`.
 fn resolve_private_key(session: &Session, select: &KeySelect) -> Result<ObjectHandle> {
     let mut template = vec![Attribute::Class(ObjectClass::PRIVATE_KEY)];
     match select {
@@ -282,10 +217,7 @@ fn resolve_private_key(session: &Session, select: &KeySelect) -> Result<ObjectHa
 fn read_always_authenticate(session: &Session, key: ObjectHandle) -> Result<bool> {
     let attrs = session
         .get_attributes(key, &[AttributeType::AlwaysAuthenticate])
-        .map_err(|source| TokenkeyError::Pkcs11 {
-            call: "C_GetAttributeValue",
-            source,
-        })?;
+        .ck("C_GetAttributeValue")?;
     Ok(attrs
         .iter()
         .any(|a| matches!(a, Attribute::AlwaysAuthenticate(true))))
@@ -295,10 +227,7 @@ fn read_always_authenticate(session: &Session, key: ObjectHandle) -> Result<bool
 fn resolve_certificate(session: &Session, key: ObjectHandle) -> Result<Option<Vec<u8>>> {
     let id_attrs = session
         .get_attributes(key, &[AttributeType::Id])
-        .map_err(|source| TokenkeyError::Pkcs11 {
-            call: "C_GetAttributeValue",
-            source,
-        })?;
+        .ck("C_GetAttributeValue")?;
     let Some(id) = id_attrs.into_iter().find_map(|a| match a {
         Attribute::Id(v) => Some(v),
         _ => None,
@@ -310,22 +239,14 @@ fn resolve_certificate(session: &Session, key: ObjectHandle) -> Result<Option<Ve
         Attribute::Class(ObjectClass::CERTIFICATE),
         Attribute::Id(id),
     ];
-    let mut handles = session
-        .find_objects(&template)
-        .map_err(|source| TokenkeyError::Pkcs11 {
-            call: "C_FindObjects",
-            source,
-        })?;
-    let Some(handle) = handles.drain(..).next() else {
+    let handles = session.find_objects(&template).ck("C_FindObjects")?;
+    let Some(&handle) = handles.first() else {
         return Ok(None);
     };
 
     let attrs = session
         .get_attributes(handle, &[AttributeType::Value])
-        .map_err(|source| TokenkeyError::Pkcs11 {
-            call: "C_GetAttributeValue",
-            source,
-        })?;
+        .ck("C_GetAttributeValue")?;
     Ok(attrs.into_iter().find_map(|a| match a {
         Attribute::Value(v) => Some(v),
         _ => None,

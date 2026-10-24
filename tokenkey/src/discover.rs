@@ -1,18 +1,18 @@
 use std::path::PathBuf;
 
 use cryptoki::object::{Attribute, AttributeType, ObjectClass};
-use x509_cert::der::oid::AssociatedOid;
 use x509_cert::der::Decode;
+use x509_cert::der::oid::AssociatedOid;
 use x509_cert::ext::pkix::KeyUsage;
 
+use crate::TokenkeyError;
 use crate::algo::KeyAlgorithm;
 use crate::error::Result;
-use crate::pkcs11::initialize;
-use crate::TokenkeyError;
+use crate::pkcs11::{CkResultExt, initialize, initialized_slots};
 
 /// A named PKCS#11 module and the candidate paths to search for it.
 pub struct ModuleSpec {
-    /// Friendly name for diagnostics.
+    /// Friendly name, e.g. `opensc-pkcs11`.
     pub name: String,
     /// Candidate filesystem paths, tried in order.
     pub paths: Vec<PathBuf>,
@@ -76,34 +76,14 @@ pub fn discover(modules: &[ModuleSpec]) -> Discovery {
 
 fn enumerate_module(path: &std::path::Path, keys: &mut Vec<DiscoveredKey>) -> Result<()> {
     let pkcs11 = initialize(path)?;
-    let slots = pkcs11
-        .get_slots_with_initialized_token()
-        .map_err(|source| TokenkeyError::Pkcs11 {
-            call: "C_GetSlotList",
-            source,
-        })?;
+    for slot in initialized_slots(&pkcs11)? {
+        let token_info = pkcs11.get_token_info(slot).ck("C_GetTokenInfo")?;
 
-    for slot in slots {
-        let token_info = pkcs11
-            .get_token_info(slot)
-            .map_err(|source| TokenkeyError::Pkcs11 {
-                call: "C_GetTokenInfo",
-                source,
-            })?;
-
-        let session = pkcs11
-            .open_ro_session(slot)
-            .map_err(|source| TokenkeyError::Pkcs11 {
-                call: "C_OpenSession",
-                source,
-            })?;
+        let session = pkcs11.open_ro_session(slot).ck("C_OpenSession")?;
 
         let cert_handles = session
             .find_objects(&[Attribute::Class(ObjectClass::CERTIFICATE)])
-            .map_err(|source| TokenkeyError::Pkcs11 {
-                call: "C_FindObjects",
-                source,
-            })?;
+            .ck("C_FindObjects")?;
 
         for handle in cert_handles {
             let attrs = session
@@ -115,10 +95,7 @@ fn enumerate_module(path: &std::path::Path, keys: &mut Vec<DiscoveredKey>) -> Re
                         AttributeType::Label,
                     ],
                 )
-                .map_err(|source| TokenkeyError::Pkcs11 {
-                    call: "C_GetAttributeValue",
-                    source,
-                })?;
+                .ck("C_GetAttributeValue")?;
 
             let mut cert_der = None;
             let mut key_id = None;

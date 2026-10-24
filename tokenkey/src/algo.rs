@@ -1,7 +1,7 @@
 use cryptoki::mechanism::Mechanism;
 use sha2::{Digest, Sha256, Sha384, Sha512};
-use x509_cert::der::oid::ObjectIdentifier;
 use x509_cert::der::Decode;
+use x509_cert::der::oid::ObjectIdentifier;
 
 use crate::error::{Result, TokenkeyError};
 

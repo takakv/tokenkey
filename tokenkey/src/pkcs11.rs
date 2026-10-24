@@ -3,10 +3,22 @@ use std::path::Path;
 use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
 use cryptoki::error::{Error as CkError, RvError};
 use cryptoki::object::{Attribute, ObjectHandle};
-use cryptoki::session::Session;
+use cryptoki::session::{Session, UserType};
 use cryptoki::slot::Slot;
+use cryptoki::types::AuthPin;
 
 use crate::error::{Result, TokenkeyError};
+
+/// Tags a cryptoki error with the PKCS#11 function that produced it.
+pub(crate) trait CkResultExt<T> {
+    fn ck(self, call: &'static str) -> Result<T>;
+}
+
+impl<T> CkResultExt<T> for cryptoki::error::Result<T> {
+    fn ck(self, call: &'static str) -> Result<T> {
+        self.map_err(|source| TokenkeyError::Pkcs11 { call, source })
+    }
+}
 
 /// Load a PKCS#11 library and initialize it.
 pub(crate) fn initialize(path: &Path) -> Result<Pkcs11> {
@@ -21,71 +33,44 @@ pub(crate) fn initialize(path: &Path) -> Result<Pkcs11> {
     }
 }
 
-/// Select the sole slot with an initialized token.
-// Adapted from kryptering 0.4.1 `src/pkcs11/mod.rs:149`.
-pub(crate) fn select_single_initialized_slot(slots: &[Slot]) -> Result<Slot> {
-    select_unique_slot(
-        slots,
-        || "no slots with an initialized token found".into(),
-        || {
-            format!(
-                "multiple initialized token slots found ({}); pin the token by slot id or label",
-                format_slot_list(slots)
-            )
-        },
-    )
+/// Slots that contain an initialized token.
+pub(crate) fn initialized_slots(pkcs11: &Pkcs11) -> Result<Vec<Slot>> {
+    pkcs11
+        .get_slots_with_initialized_token()
+        .ck("C_GetSlotList")
 }
 
-/// Select the sole slot in `slots`.
-pub(crate) fn select_unique_slot(
-    slots: &[Slot],
+/// The sole item of `items`, or an error.
+pub(crate) fn exactly_one<T: Copy>(
+    items: &[T],
     not_found: impl FnOnce() -> String,
-    ambiguous: impl FnOnce() -> String,
-) -> Result<Slot> {
-    match slots {
+    ambiguous: impl FnOnce(&[T]) -> String,
+) -> Result<T> {
+    match items {
         [] => Err(TokenkeyError::NotFound(not_found())),
-        [slot] => Ok(*slot),
-        _ => Err(TokenkeyError::Ambiguous(ambiguous())),
+        [item] => Ok(*item),
+        many => Err(TokenkeyError::Ambiguous(ambiguous(many))),
     }
 }
 
-// Adapted from kryptering 0.4.1 `src/pkcs11/mod.rs:187`.
-fn format_slot_list(slots: &[Slot]) -> String {
-    slots
-        .iter()
-        .map(|slot| slot.id().to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-// Adapted from kryptering 0.4.1 `src/pkcs11/mod.rs:271` (BSD-2-Clause).
+/// The sole object matching `template`.
 pub(crate) fn find_unique(
     session: &Session,
     template: &[Attribute],
     what: &str,
 ) -> Result<ObjectHandle> {
-    let mut objects = session
-        .find_objects(template)
-        .map_err(|source| TokenkeyError::Pkcs11 {
-            call: "C_FindObjects",
-            source,
-        })?;
-    match objects.len() {
-        0 => Err(TokenkeyError::NotFound(format!(
-            "no {what} object matched the query"
-        ))),
-        1 => Ok(objects.remove(0)),
-        n => Err(TokenkeyError::Ambiguous(format!(
-            "ambiguous {what} lookup: {n} objects matched the query; narrow it with a CKA_ID"
-        ))),
-    }
+    let objects = session.find_objects(template).ck("C_FindObjects")?;
+    exactly_one(
+        &objects,
+        || format!("no {what} object matched the query"),
+        |many| format!("{} {what} objects matched the query", many.len()),
+    )
 }
 
-/// Map the result of a `C_Login` to local types.
-pub(crate) fn map_login_result(result: std::result::Result<(), CkError>) -> Result<()> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(CkError::Pkcs11(RvError::UserAlreadyLoggedIn, _)) => Ok(()),
+/// `C_Login`, mapping PIN errors to their own variants.
+pub(crate) fn login(session: &Session, user: UserType, pin: &AuthPin) -> Result<()> {
+    match session.login(user, Some(pin)) {
+        Ok(()) | Err(CkError::Pkcs11(RvError::UserAlreadyLoggedIn, _)) => Ok(()),
         Err(CkError::Pkcs11(RvError::PinIncorrect, _)) => Err(TokenkeyError::IncorrectPin),
         Err(CkError::Pkcs11(RvError::PinLocked, _)) => Err(TokenkeyError::PinLocked),
         Err(source) => Err(TokenkeyError::Pkcs11 {

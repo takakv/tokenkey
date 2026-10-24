@@ -1,7 +1,7 @@
 /// An error from an `esteid` operation.
 #[derive(Debug, thiserror::Error)]
 pub enum EstEidError {
-    /// No token matches EstEID structure.
+    /// No Estonian ID card was found.
     #[error("no Estonian ID card found")]
     NoCard,
 

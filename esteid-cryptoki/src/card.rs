@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use tokenkey::{discover, DiscoveredKey, Discovery, KeyClass, TokenKey};
+use tokenkey::{DiscoveredKey, Discovery, KeyClass, TokenKey, discover};
 
+use crate::EstEidError;
 use crate::error::Result;
 use crate::filter::{is_esteid_issued, modules};
-use crate::EstEidError;
 
 /// An Estonian ID card.
 pub struct IdCard {
@@ -16,14 +16,14 @@ pub struct IdCard {
 }
 
 impl IdCard {
-    /// All discovered connected Estonian ID cards.
+    /// All connected Estonian ID cards.
     pub fn list() -> Result<Vec<IdCard>> {
-        Ok(cards_from_pairs(pair_cards(discover(&modules()))))
+        Ok(cards_from_pairs(pair_cards(discover_keys()?)))
     }
 
-    /// Find a specific ID card.
+    /// Find the connected ID card. Errors unless exactly one card is connected and both its keys are found.
     pub fn find() -> Result<IdCard> {
-        find_from_pairs(pair_cards(discover(&modules())))
+        find_from_pairs(pair_cards(discover_keys()?))
     }
 
     /// The card's document number.
@@ -41,8 +41,7 @@ impl IdCard {
         &self.sign.cert_der
     }
 
-    /// Open the Authentication key for signing.
-    /// Requires PIN1.
+    /// Open the Authentication key. Requires PIN1.
     pub fn open_auth(&self, pin1: &str) -> Result<TokenKey> {
         Ok(TokenKey::open_discovered(&self.auth, pin1)?)
     }
@@ -65,13 +64,23 @@ enum CardOutcome {
     },
 }
 
-fn pair_cards(discovery: Discovery) -> Vec<CardOutcome> {
+fn discover_keys() -> Result<Vec<DiscoveredKey>> {
+    let Discovery { keys, skipped } = discover(&modules());
+    if keys.is_empty()
+        && let Some(module) = skipped.into_iter().next()
+    {
+        return Err(module.error.into());
+    }
+    Ok(keys)
+}
+
+fn pair_cards(keys: Vec<DiscoveredKey>) -> Vec<CardOutcome> {
     // OpenSC exposes a card's auth and signing keys as separate slots.
     // We can group by serial since the serial is the same for both.
     let mut groups: BTreeMap<(PathBuf, String), (Option<DiscoveredKey>, Option<DiscoveredKey>)> =
         BTreeMap::new();
 
-    for key in discovery.keys {
+    for key in keys {
         if !matches!(key.usage, KeyClass::Authentication | KeyClass::Signing) {
             continue;
         }
