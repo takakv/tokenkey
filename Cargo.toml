@@ -8,6 +8,6 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 cryptoki = "0.12"
-x509-cert = "0.2"
-sha2 = "0.10"
+x509-cert = "0.3"
+sha2 = "0.11"
 thiserror = "2"

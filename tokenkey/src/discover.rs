@@ -157,7 +157,7 @@ fn classify(cert_der: &[u8]) -> KeyClass {
     let Ok(cert) = x509_cert::Certificate::from_der(cert_der) else {
         return KeyClass::Other;
     };
-    let Some(extensions) = cert.tbs_certificate.extensions.as_ref() else {
+    let Some(extensions) = cert.tbs_certificate().extensions() else {
         return KeyClass::Other;
     };
     let Some(ext) = extensions.iter().find(|e| e.extn_id == KeyUsage::OID) else {

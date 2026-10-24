@@ -39,7 +39,7 @@ impl KeyAlgorithm {
         let cert = x509_cert::Certificate::from_der(cert_der).map_err(|e| {
             TokenkeyError::Certificate(format!("certificate is not valid DER: {e}"))
         })?;
-        let spki = &cert.tbs_certificate.subject_public_key_info;
+        let spki = cert.tbs_certificate().subject_public_key_info();
         let alg_oid = spki.algorithm.oid;
 
         if alg_oid == OID_EC_PUBLIC_KEY {

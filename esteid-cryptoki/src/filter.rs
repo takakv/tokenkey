@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
 use tokenkey::ModuleSpec;
+use x509_cert::der::Decode;
 use x509_cert::der::asn1::{PrintableStringRef, Utf8StringRef};
 use x509_cert::der::oid::ObjectIdentifier;
-use x509_cert::der::Decode;
 
 const OID_COMMON_NAME: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.3");
 
@@ -43,20 +43,18 @@ pub(crate) fn is_esteid_issued(cert_der: &[u8]) -> bool {
 
 /// The issuer's `CN` attribute.
 fn issuer_common_name(cert: &x509_cert::Certificate) -> Option<String> {
-    cert.tbs_certificate.issuer.0.iter().find_map(|rdn| {
-        rdn.0.iter().find_map(|atv| {
-            if atv.oid != OID_COMMON_NAME {
-                return None;
-            }
-            atv.value
-                .decode_as::<Utf8StringRef>()
-                .map(|s| s.to_string())
-                .or_else(|_| {
-                    atv.value
-                        .decode_as::<PrintableStringRef>()
-                        .map(|s| s.to_string())
-                })
-                .ok()
-        })
+    cert.tbs_certificate().issuer().iter().find_map(|atv| {
+        if atv.oid != OID_COMMON_NAME {
+            return None;
+        }
+        atv.value
+            .decode_as::<Utf8StringRef>()
+            .map(|s| s.to_string())
+            .or_else(|_| {
+                atv.value
+                    .decode_as::<PrintableStringRef>()
+                    .map(|s| s.to_string())
+            })
+            .ok()
     })
 }
